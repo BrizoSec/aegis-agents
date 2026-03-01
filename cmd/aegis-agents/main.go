@@ -1,8 +1,11 @@
 package main
 
 import (
+	"encoding/json"
 	"log/slog"
 	"os"
+	"os/signal"
+	"syscall"
 
 	"github.com/aegis/aegis-agents/config"
 	"github.com/aegis/aegis-agents/internal/comms"
@@ -55,9 +58,34 @@ func main() {
 
 	// Subscribe to inbound task_spec messages from the Orchestrator.
 	if err := commsClient.Subscribe("task_spec", func(msg *comms.Message) {
-		// TODO: unmarshal Envelope → extract TaskSpec → call f.HandleTaskSpec
-		log.Info("task_spec received", "bytes", len(msg.Data))
-		_ = f // wired; handler body populated during integration
+		var env types.Envelope
+		if err := json.Unmarshal(msg.Data, &env); err != nil {
+			log.Error("malformed envelope", "error", err)
+			return
+		}
+
+		// Payload unmarshals as map[string]interface{}; re-encode to extract TaskSpec.
+		payloadBytes, err := json.Marshal(env.Payload)
+		if err != nil {
+			log.Error("envelope payload marshal failed", "trace_id", env.TraceID, "error", err)
+			return
+		}
+
+		var spec types.TaskSpec
+		if err := json.Unmarshal(payloadBytes, &spec); err != nil {
+			log.Error("task_spec unmarshal failed", "trace_id", env.TraceID, "error", err)
+			return
+		}
+
+		log.Info("task_spec received", "task_id", spec.TaskID, "trace_id", spec.TraceID)
+
+		if err := f.HandleTaskSpec(&spec); err != nil {
+			log.Error("handle task_spec failed",
+				"task_id", spec.TaskID,
+				"trace_id", spec.TraceID,
+				"error", err,
+			)
+		}
 	}); err != nil {
 		log.Error("subscribe task_spec failed", "error", err)
 		os.Exit(1)
@@ -65,8 +93,15 @@ func main() {
 
 	log.Info("aegis-agents ready")
 
-	// Block forever. Replace with signal handling and graceful shutdown.
-	select {}
+	stop := make(chan os.Signal, 1)
+	signal.Notify(stop, syscall.SIGINT, syscall.SIGTERM)
+	<-stop
+
+	log.Info("shutdown signal received, stopping")
+	if err := commsClient.Close(); err != nil {
+		log.Error("comms close failed", "error", err)
+	}
+	log.Info("aegis-agents stopped")
 }
 
 // seedSkills registers the initial skill tree. In production this is loaded from

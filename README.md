@@ -103,21 +103,25 @@ go build ./...
 
 ### Configuration
 
-All configuration is environment-based. Copy and edit the example:
+All configuration is environment-based:
+
+| Variable | Required | Description |
+|----------|----------|-------------|
+| `AEGIS_NATS_URL` | Yes | NATS JetStream endpoint (e.g., `nats://localhost:4222`) |
+| `AEGIS_OPENBAO_ADDR` | Yes | OpenBao API address (e.g., `http://localhost:8200`) |
+| `AEGIS_MEMORY_ADDR` | Yes | Memory Component HTTP endpoint (e.g., `http://localhost:9000`) |
+| `AEGIS_COMPONENT_ID` | No | Identity published in message envelopes (defaults to `aegis-agents`) |
+
+### Standalone / Stub Mode
+
+All external dependencies (NATS, OpenBao, Firecracker, Memory Component) have in-process stubs. The binary runs fully in-memory without any external services — useful for development and unit testing. To run in stub mode, the env vars are still required but can point to non-existent addresses since no real connections are made:
 
 ```bash
-cp config/.env.example .env
+AEGIS_NATS_URL=nats://localhost:4222 \
+AEGIS_OPENBAO_ADDR=http://localhost:8200 \
+AEGIS_MEMORY_ADDR=http://localhost:9000 \
+go run ./cmd/aegis-agents
 ```
-
-Key variables:
-
-| Variable | Description |
-|----------|-------------|
-| `NATS_URL` | NATS JetStream endpoint (e.g., `nats://localhost:4222`) |
-| `OPENBAO_ADDR` | OpenBao API address |
-| `MEMORY_COMPONENT_ADDR` | Memory Component service address |
-| `LOG_LEVEL` | `debug`, `info`, `warn`, `error` |
-| `FIRECRACKER_BIN` | Path to Firecracker binary (set to `stub` in dev) |
 
 ### Run Tests
 
@@ -128,6 +132,66 @@ go test ./internal/...
 # Integration tests (requires NATS)
 go test ./test/integration/...
 ```
+
+---
+
+## How It Works
+
+### Startup
+
+On launch, `main.go` loads config, wires all seven modules via dependency injection into the Agent Factory, seeds the skill tree, and subscribes to the `task_spec` NATS subject. The component is then ready to receive tasks.
+
+### Task Flow
+
+```
+Orchestrator
+    │
+    │  Envelope{ payload: TaskSpec }
+    ▼
+comms.Subscribe("task_spec")          ← M1: Communications Interface
+    │
+    │  Unmarshal Envelope → TaskSpec
+    ▼
+factory.HandleTaskSpec(spec)          ← M2: Agent Factory
+    │
+    ├─► registry.FindBySkills(domains) ← M3: Registry
+    │       │
+    │       ├─ [idle agent found] ──► registry.AssignTask → publish status_update
+    │       │
+    │       └─ [no match] → provision new agent:
+    │               1. skills.GetDomain(domain)          ← M4: Skills
+    │               2. credentials.PreAuthorize(agentID) ← M5: Credential Broker → OpenBao
+    │               3. lifecycle.Spawn(vmConfig)         ← M6: Lifecycle Manager → Firecracker
+    │               4. registry.Register(agentRecord)    ← M3: Registry
+    │
+    │  Agent executes task (skill discovery + lazy credential delivery on demand)
+    │
+    ▼
+factory.CompleteTask(agentID, output)
+    │
+    ├─► memory.Write(taggedResult)      ← M7: Memory Interface → Memory Component
+    ├─► comms.Publish("task_result")    ← M1: back to Orchestrator
+    ├─► lifecycle.Terminate(agentID)    ← M6: teardown microVM
+    ├─► credentials.Revoke(agentID)     ← M5: invalidate scoped token
+    └─► registry.UpdateState("idle")    ← M3: mark agent available
+```
+
+### Skill Discovery (Progressive Disclosure)
+
+Agents do not receive their full capability set at spawn. The three-step drill-down prevents context bloat:
+
+1. **Domain** — Agent receives only the entry-point domain name at spawn (e.g., `"web"`)
+2. **Commands** — Agent queries `GetCommands("web")` to list available operations (e.g., `"web.fetch"`)
+3. **Spec** — Agent queries `GetSpec("web", "web.fetch")` only when constructing a specific call
+
+### Credential Delivery (Two-Phase)
+
+1. **Pre-authorize (spawn time)** — Credential Broker requests a scoped vault token from OpenBao covering the permission set derived from the task's required skill domains. The token is stored but not given to the agent.
+2. **Lazy delivery (runtime)** — When the agent invokes a skill that requires a credential, the Broker validates the request against the pre-approved permission set and returns the specific secret value. Nothing else is disclosed.
+
+### Shutdown
+
+On `SIGINT` or `SIGTERM`, the component drains in-flight work, closes the comms connection, and exits cleanly.
 
 ---
 
