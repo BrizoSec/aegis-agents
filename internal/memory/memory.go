@@ -1,7 +1,8 @@
-// Package memory is M7 — the Memory Interface. It is the only module permitted
-// to communicate with the Memory Component. All writes are surgical and tagged;
-// reads are always filtered by agent ID and context tag. Full session dumps are
-// explicitly forbidden.
+// Package memory is M7 — the Memory Interface. It formats and dispatches tagged
+// memory payloads to the Orchestrator via the Comms Interface (NATS). This component
+// never contacts the Memory Component directly — the Orchestrator owns that routing.
+// All writes are surgical and tagged; reads are always filtered by agent ID and
+// context tag. Full session dumps are explicitly forbidden.
 package memory
 
 import (
@@ -23,7 +24,9 @@ type Client interface {
 }
 
 // stubClient is the default in-process implementation.
-// Replace HTTP calls to the real Memory Component when it is available.
+// The production implementation publishes to the Orchestrator via comms.Publish
+// on subjects such as "memory.write" and "memory.read". The Orchestrator routes
+// those messages to the Memory Component. Never make direct HTTP calls here.
 type stubClient struct {
 	mu      sync.RWMutex
 	records map[string][]types.MemoryWrite // keyed by agentID

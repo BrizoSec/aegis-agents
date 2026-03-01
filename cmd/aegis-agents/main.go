@@ -30,7 +30,6 @@ func main() {
 	log.Info("starting aegis-agents",
 		"component_id", cfg.ComponentID,
 		"nats_url", cfg.NATSURL,
-		"memory_addr", cfg.MemoryAddr,
 	)
 
 	// Wire dependencies.

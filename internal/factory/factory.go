@@ -167,7 +167,7 @@ func (f *Factory) CompleteTask(agentID, sessionID, traceID string, output interf
 		return fmt.Errorf("factory: registry.Get: %w", err)
 	}
 
-	// Persist tagged output to Memory Component.
+	// Publish tagged output via Memory Interface. The Orchestrator routes it to the Memory Component.
 	mw := &types.MemoryWrite{
 		AgentID:   agentID,
 		SessionID: sessionID,

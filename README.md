@@ -109,8 +109,9 @@ All configuration is environment-based:
 |----------|----------|-------------|
 | `AEGIS_NATS_URL` | Yes | NATS JetStream endpoint (e.g., `nats://localhost:4222`) |
 | `AEGIS_OPENBAO_ADDR` | Yes | OpenBao API address (e.g., `http://localhost:8200`) |
-| `AEGIS_MEMORY_ADDR` | Yes | Memory Component HTTP endpoint (e.g., `http://localhost:9000`) |
 | `AEGIS_COMPONENT_ID` | No | Identity published in message envelopes (defaults to `aegis-agents`) |
+
+No address is configured for the Memory Component or other peers — this component never connects to them directly.
 
 ### Standalone / Stub Mode
 
@@ -169,7 +170,7 @@ factory.HandleTaskSpec(spec)          ← M2: Agent Factory
     ▼
 factory.CompleteTask(agentID, output)
     │
-    ├─► memory.Write(taggedResult)      ← M7: Memory Interface → Memory Component
+    ├─► memory.Write(taggedResult)      ← M7: Memory Interface → comms.Publish("memory.write") → Orchestrator → Memory Component
     ├─► comms.Publish("task_result")    ← M1: back to Orchestrator
     ├─► lifecycle.Terminate(agentID)    ← M6: teardown microVM
     ├─► credentials.Revoke(agentID)     ← M5: invalidate scoped token
@@ -231,12 +232,12 @@ aegis-agents/
 
 ## External Integrations
 
-| Component | Protocol | Our Role |
-|-----------|----------|----------|
-| Orchestrator | NATS JetStream | Receive `task_spec`, publish `task_result` and `capability_response` |
-| Communications Component | NATS JetStream | All external messages route through this transport |
-| Credential Vault (OpenBao) | HTTP API | Request permission scopes at spawn; validate credential requests at runtime |
-| Memory Component | Internal API | Write tagged agent state; read filtered context slices |
+This component has exactly two external integration points. It does not hold direct connections to the Memory Component, I/O Component, or any other Aegis peer — those are the Orchestrator's responsibility to route to.
+
+| Component | Protocol | Role |
+|-----------|----------|------|
+| Orchestrator | NATS JetStream (via Comms Interface) | **Sole external peer.** Receive `task_spec`; publish `task_result`, `status_update`, `capability_response`, `memory.write`, `memory.read` |
+| Credential Vault (OpenBao) | HTTP API (direct) | Pre-authorize permission scopes at spawn; validate and deliver credentials at runtime. Direct access is intentional — secrets must not transit the Orchestrator. |
 
 ---
 

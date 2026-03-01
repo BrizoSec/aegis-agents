@@ -8,7 +8,9 @@ This file is the persistent project briefing for Claude Code. Read this at the s
 
 `aegis-agents` is the **Agents Component** of Aegis OS — a distributed, hardened operating system purpose-built for running autonomous AI agents. This repo is one of several components built by separate teams. We own the agent lifecycle end-to-end: receiving tasks, provisioning agents, managing skills and credentials, and maintaining the agent registry.
 
-We do **not** own: task routing/matching (Orchestrator), persistent storage (Memory Component), secret storage (Credential Vault / OpenBao), or message transport (Communications Component / NATS JetStream). We integrate with all four.
+We do **not** own: task routing/matching (Orchestrator), persistent storage (Memory Component), secret storage (Credential Vault / OpenBao), or message transport (Communications Component / NATS JetStream).
+
+**Boundary rule:** This component communicates exclusively with the Orchestrator via NATS. It does not hold connections to the Memory Component, I/O Component, or any other Aegis peer. Those are the Orchestrator's responsibility to route to. The only exception is the Credential Vault (OpenBao), which is accessed directly for security-isolation reasons.
 
 ---
 
@@ -26,8 +28,8 @@ We do **not** own: task routing/matching (Orchestrator), persistent storage (Mem
 
 These are settled decisions. Do not re-litigate them.
 
-**1. Single Communications Gateway**
-All inter-component messaging (to/from Orchestrator, Memory, Vault, Comms) flows through the `comms` module. No internal module calls external components directly. This is the primary integration boundary.
+**1. Orchestrator Is the Only External Peer**
+This component communicates with exactly one external component: the Orchestrator, via NATS through the `comms` module. All outbound messages (task results, status updates, memory writes, capability responses) are published to NATS subjects that the Orchestrator consumes and routes onward. No module in this component holds a direct connection to the Memory Component, I/O Component, or any other Aegis peer. The `comms` module is the sole exit point.
 
 **2. MicroVM per Agent**
 Every agent runs in its own Firecracker microVM. A compromised agent cannot reach another agent or the host OS. The Lifecycle Manager owns VM spawn and teardown.
@@ -39,7 +41,7 @@ Agents do not receive their full skill set at spawn. Skills are organized in a t
 Credentials are pre-authorized at spawn time (permission set scoped to the task) but not delivered until the agent explicitly requests a specific credential during skill invocation. This minimizes the exposure window and enforces least privilege. The Credential Broker owns this two-phase model.
 
 **5. Stateless Component**
-The Agents Component owns no persistent storage. All state that must survive restarts (agent registry, skill definitions, session history) is written to the Memory Component via the Memory Interface. Writes are surgical — only explicitly tagged, resolved data is persisted. Never dump full session state.
+The Agents Component owns no persistent storage. All state that must survive restarts (agent registry, skill definitions, session history) is published to the Orchestrator via NATS using the Memory Interface module — the Orchestrator routes those writes to the Memory Component. Writes are surgical — only explicitly tagged, resolved data is persisted. Never dump full session state.
 
 **6. Orchestrator Owns Task Matching**
 We do not decide which task goes to which agent. The Orchestrator does. We respond to capability queries (does an agent with these skills exist?) and provision agents when asked. Do not build task routing logic into this component.
@@ -52,33 +54,39 @@ We do not decide which task goes to which agent. The Orchestrator does. We respo
 |---|---|---|
 | M1 — Communications Interface | `internal/comms` | Single inbound/outbound NATS gateway. All external messages enter and leave here. |
 | M2 — Agent Factory | `internal/factory` | Central coordinator. Receives task specs, queries registry, initiates provisioning for new agents. |
-| M3 — Agent Registry | `internal/registry` | In-memory catalog of agents (ID, state, skill domains, credential permission set). Backed by Memory Component. |
+| M3 — Agent Registry | `internal/registry` | In-memory catalog of agents (ID, state, skill domains, credential permission set). State is persisted via M7 → Orchestrator → Memory Component. |
 | M4 — Skill Hierarchy Manager | `internal/skills` | Owns the skills tree. Serves skill discovery on demand. Never pre-loads leaf-level detail. |
 | M5 — Credential Broker | `internal/credentials` | Two-phase credential model: pre-authorize at spawn, lazy delivery at runtime. Talks to OpenBao. |
 | M6 — Lifecycle Manager | `internal/lifecycle` | Spawns and terminates Firecracker microVMs. Health monitoring, crash recovery, state updates. |
-| M7 — Memory Interface | `internal/memory` | Thin layer for all Memory Component interactions. Enforces tagged writes, filtered reads. |
+| M7 — Memory Interface | `internal/memory` | Formats and dispatches tagged memory payloads to the Orchestrator via Comms (NATS). Never contacts the Memory Component directly. Enforces tagged writes, filtered reads. |
 
 ---
 
 ## External Interface Contracts
 
-### Orchestrator (via Comms / NATS)
-- **Inbound:** `task_spec` — task assignment with required skill domains and metadata
-- **Outbound:** `task_result` — completion payload; `status_update` — progress events; `capability_response` — answer to capability queries
+This component has exactly two external integration points: the Orchestrator (via NATS) and the Credential Vault (OpenBao, direct). There are no other outbound connections.
 
-### Credential Vault (OpenBao API)
+### Orchestrator (via Comms / NATS) — Primary and only peer
+All inter-component communication flows through NATS subjects. The Orchestrator is the subscriber for all outbound messages and is the publisher of all inbound messages.
+
+- **Inbound subjects:**
+  - `task_spec` — task assignment with required skill domains and metadata
+- **Outbound subjects:**
+  - `task_result` — completion payload
+  - `status_update` — progress events
+  - `capability_response` — answer to capability queries
+  - `memory.write` — tagged memory payload for the Orchestrator to route to the Memory Component
+  - `memory.read` — filtered read request for the Orchestrator to route to the Memory Component
+
+All messages use the standard envelope: `{ message_id, source, destination, timestamp, payload, trace_id }`
+At-least-once delivery for task results and status. At-most-once for heartbeats.
+Do not publish to NATS directly. Always route through `internal/comms`.
+
+### Credential Vault (OpenBao API) — Direct access, exception to above rule
+The Credential Broker is the only module with a direct external connection outside of NATS. It contacts OpenBao directly because routing secrets through the Orchestrator would create an unnecessary exposure surface.
 - **Phase 1 (spawn):** POST permission scope request → receive scoped vault token
 - **Phase 2 (runtime):** Agent requests specific secret → Credential Broker validates against pre-approved set → returns secret value
 - Security levels: L0 (public) through L4 (vault-reserved). Skill domain dictates required level.
-
-### Memory Component (via Memory Interface)
-- **Writes:** Tagged payloads only. Tag includes: agent ID, session ID, data type, TTL hint.
-- **Reads:** Filtered slices by agent ID + context tag. Never request full agent history.
-
-### Communications Component (NATS JetStream)
-- All messages use the standard envelope: `{ message_id, source, destination, timestamp, payload, trace_id }`
-- At-least-once delivery for task results and status. At-most-once for heartbeats.
-- Do not publish to NATS directly. Always route through `internal/comms`.
 
 ---
 
