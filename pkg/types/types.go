@@ -80,10 +80,50 @@ type StatusUpdate struct {
 	TraceID string `json:"trace_id"`
 }
 
+// CapabilityQuery is received from the Orchestrator asking whether an agent
+// with the specified skill domains exists.
+type CapabilityQuery struct {
+	QueryID string   `json:"query_id"`
+	Domains []string `json:"domains"`
+	TraceID string   `json:"trace_id"`
+}
+
 // CapabilityResponse answers an Orchestrator capability query.
 type CapabilityResponse struct {
 	QueryID  string   `json:"query_id"`
 	Domains  []string `json:"domains"`
 	HasMatch bool     `json:"has_match"`
 	TraceID  string   `json:"trace_id"`
+}
+
+// CredentialRequest is sent to the Orchestrator to obtain a scoped credential.
+// The Orchestrator proxies this to the Credential Vault and returns a CredentialResponse.
+type CredentialRequest struct {
+	AgentID       string   `json:"agent_id"`
+	PermissionSet []string `json:"permission_set"`
+	TraceID       string   `json:"trace_id"`
+}
+
+// CredentialResponse is received from the Orchestrator carrying the scoped token
+// returned by the Credential Vault.
+type CredentialResponse struct {
+	AgentID string `json:"agent_id"`
+	Token   string `json:"token"`
+	TraceID string `json:"trace_id"`
+}
+
+// MemoryReadRequest is sent to the Orchestrator to retrieve filtered memory context.
+// The Orchestrator routes this to the Memory Component.
+type MemoryReadRequest struct {
+	AgentID    string `json:"agent_id"`
+	ContextTag string `json:"context_tag"`
+	TraceID    string `json:"trace_id"`
+}
+
+// MemoryResponse is received from the Orchestrator carrying records returned
+// by the Memory Component in response to a MemoryReadRequest.
+type MemoryResponse struct {
+	AgentID string        `json:"agent_id"`
+	Records []MemoryWrite `json:"records"`
+	TraceID string        `json:"trace_id"`
 }

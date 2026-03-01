@@ -90,6 +90,46 @@ func main() {
 		os.Exit(1)
 	}
 
+	// Subscribe to capability_query — Orchestrator asking whether a capable agent exists.
+	if err := commsClient.Subscribe("capability_query", func(msg *comms.Message) {
+		var env types.Envelope
+		if err := json.Unmarshal(msg.Data, &env); err != nil {
+			log.Error("malformed envelope", "error", err)
+			return
+		}
+
+		payloadBytes, err := json.Marshal(env.Payload)
+		if err != nil {
+			log.Error("capability_query payload marshal failed", "trace_id", env.TraceID, "error", err)
+			return
+		}
+
+		var query types.CapabilityQuery
+		if err := json.Unmarshal(payloadBytes, &query); err != nil {
+			log.Error("capability_query unmarshal failed", "trace_id", env.TraceID, "error", err)
+			return
+		}
+
+		candidates, err := reg.FindBySkills(query.Domains)
+		if err != nil {
+			log.Error("capability_query registry lookup failed", "trace_id", query.TraceID, "error", err)
+			return
+		}
+
+		resp := types.CapabilityResponse{
+			QueryID:  query.QueryID,
+			Domains:  query.Domains,
+			HasMatch: len(candidates) > 0,
+			TraceID:  query.TraceID,
+		}
+		if err := commsClient.Publish("capability_response", resp); err != nil {
+			log.Error("publish capability_response failed", "trace_id", query.TraceID, "error", err)
+		}
+	}); err != nil {
+		log.Error("subscribe capability_query failed", "error", err)
+		os.Exit(1)
+	}
+
 	log.Info("aegis-agents ready")
 
 	stop := make(chan os.Signal, 1)

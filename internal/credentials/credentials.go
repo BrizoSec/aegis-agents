@@ -1,7 +1,9 @@
-// Package credentials is M5 — the Credential Broker. It implements the two-phase
-// lazy credential delivery model: pre-authorize a permission set at agent spawn
-// (Phase 1), then deliver individual secrets only when explicitly requested
-// during skill invocation (Phase 2).
+// Package credentials is M5 — the Credential Broker. It is a request builder only.
+// It formats and tags credential request payloads scoped to task requirements,
+// then hands them to internal/comms for delivery to the Orchestrator. The
+// Orchestrator proxies those requests to the Credential Vault (OpenBao). This
+// package does NOT call OpenBao or any external API directly — that is a
+// security violation and must not be introduced.
 package credentials
 
 import (
@@ -33,15 +35,16 @@ type agentAuth struct {
 }
 
 // stubBroker is the default implementation backed by in-process maps.
-// Replace vault interactions with real OpenBao API calls when the Credential
-// Vault is available.
+// The production implementation publishes credential_request payloads to the
+// Orchestrator via comms.Publish and awaits a credential_response. It never
+// calls OpenBao directly.
 type stubBroker struct {
 	mu     sync.RWMutex
 	agents map[string]*agentAuth
 
 	// stubSecrets simulates the vault. In production this is replaced by
 	// OpenBao API calls using the agent's scoped vault token.
-	stubSecrets map[string]string
+	stubSecrets map[string]string // simulates vault responses; replaced by Orchestrator responses in production
 }
 
 // New returns a Credential Broker backed by an in-process stub vault.
@@ -64,7 +67,7 @@ func (b *stubBroker) PreAuthorize(agentID string, permissionSet []string) (strin
 		return "", fmt.Errorf("credentials: permissionSet must not be empty")
 	}
 
-	token := "stub-token-" + agentID // deterministic for tests; production uses OpenBao
+	token := "stub-token-" + agentID // deterministic for tests; production token comes from Orchestrator credential_response
 
 	perms := make(map[string]struct{}, len(permissionSet))
 	for _, p := range permissionSet {

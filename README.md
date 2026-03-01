@@ -17,7 +17,7 @@ This component is one of five in the Aegis OS platform. It does not own task rou
 - **Agent Provisioning** — Spawn new agents inside Firecracker microVMs when no capable agent exists for a task
 - **Agent Registry** — Maintain a catalog of all agents, their capabilities, states, and credential permission sets
 - **Skill Management** — Serve agent skills via a progressive disclosure hierarchy (domain → command → parameter spec)
-- **Credential Brokering** — Pre-authorize credential access at spawn; deliver credentials lazily at runtime via OpenBao
+- **Credential Brokering** — Pre-authorize credential access at spawn; deliver credentials lazily at runtime via requests to the Orchestrator
 - **Lifecycle Management** — Health monitoring, crash recovery, graceful shutdown, and VM teardown
 - **State Persistence** — Delegate all persistence to the Memory Component via a disciplined interface
 
@@ -51,9 +51,9 @@ The component is organized into seven modules with a strict single-responsibilit
          │
          ▼
    ┌─────────────────────────────────┐
-   │ External Components             │
-   │  Orchestrator  │  Comms (NATS)  │
-   │  OpenBao Vault │  Memory        │
+   ┌─────────────────────────────────┐
+   │ Orchestrator (sole external peer│
+   │      via NATS JetStream)        │
    └─────────────────────────────────┘
 ```
 
@@ -61,11 +61,11 @@ The component is organized into seven modules with a strict single-responsibilit
 |--------|---------|------|
 | M1 — Communications Interface | `internal/comms` | Single NATS gateway for all inter-component messaging |
 | M2 — Agent Factory | `internal/factory` | Central coordinator for all agent provisioning |
-| M3 — Agent Registry | `internal/registry` | In-memory catalog backed by Memory Component |
+| M3 — Agent Registry | `internal/registry` | In-memory catalog; state persisted via M7 → Orchestrator → Memory Component |
 | M4 — Skill Hierarchy Manager | `internal/skills` | Three-level skill tree with on-demand discovery |
-| M5 — Credential Broker | `internal/credentials` | Two-phase credential authorization via OpenBao |
+| M5 — Credential Broker | `internal/credentials` | Formats `credential_request` payloads; routes to Orchestrator via Comms. Does not call OpenBao directly. |
 | M6 — Lifecycle Manager | `internal/lifecycle` | Firecracker microVM spawn, monitoring, teardown |
-| M7 — Memory Interface | `internal/memory` | Disciplined persistence layer to Memory Component |
+| M7 — Memory Interface | `internal/memory` | Formats `memory_write_request` / `memory_read_request` payloads; routes to Orchestrator via Comms. Does not call any storage API directly. |
 
 ---
 
@@ -89,7 +89,6 @@ The component is organized into seven modules with a strict single-responsibilit
 
 - Go 1.22+
 - NATS Server (for integration testing)
-- Access to OpenBao instance (for credential integration)
 - Firecracker binary (for microVM lifecycle — stub available for development)
 
 ### Install & Run
@@ -108,20 +107,16 @@ All configuration is environment-based:
 | Variable | Required | Description |
 |----------|----------|-------------|
 | `AEGIS_NATS_URL` | Yes | NATS JetStream endpoint (e.g., `nats://localhost:4222`) |
-| `AEGIS_OPENBAO_ADDR` | Yes | OpenBao API address (e.g., `http://localhost:8200`) |
 | `AEGIS_COMPONENT_ID` | No | Identity published in message envelopes (defaults to `aegis-agents`) |
 
-No address is configured for the Memory Component or other peers — this component never connects to them directly.
+No addresses are configured for OpenBao, the Memory Component, or any other peer. All cross-component communication routes through the Orchestrator via NATS.
 
 ### Standalone / Stub Mode
 
-All external dependencies (NATS, OpenBao, Firecracker, Memory Component) have in-process stubs. The binary runs fully in-memory without any external services — useful for development and unit testing. To run in stub mode, the env vars are still required but can point to non-existent addresses since no real connections are made:
+All external dependencies (NATS, Firecracker, Orchestrator, Memory Component, Credential Vault) have in-process stubs. The binary runs fully in-memory without any external services — useful for development and unit testing. Only `AEGIS_NATS_URL` is required; it can point to a non-existent address since no real connection is made in stub mode:
 
 ```bash
-AEGIS_NATS_URL=nats://localhost:4222 \
-AEGIS_OPENBAO_ADDR=http://localhost:8200 \
-AEGIS_MEMORY_ADDR=http://localhost:9000 \
-go run ./cmd/aegis-agents
+AEGIS_NATS_URL=nats://localhost:4222 go run ./cmd/aegis-agents
 ```
 
 ### Run Tests
@@ -161,7 +156,7 @@ factory.HandleTaskSpec(spec)          ← M2: Agent Factory
     │       │
     │       └─ [no match] → provision new agent:
     │               1. skills.GetDomain(domain)          ← M4: Skills
-    │               2. credentials.PreAuthorize(agentID) ← M5: Credential Broker → OpenBao
+    │               2. credentials.PreAuthorize(agentID) ← M5: Credential Broker → comms.Publish("credential_request") → Orchestrator → Vault
     │               3. lifecycle.Spawn(vmConfig)         ← M6: Lifecycle Manager → Firecracker
     │               4. registry.Register(agentRecord)    ← M3: Registry
     │
@@ -170,7 +165,7 @@ factory.HandleTaskSpec(spec)          ← M2: Agent Factory
     ▼
 factory.CompleteTask(agentID, output)
     │
-    ├─► memory.Write(taggedResult)      ← M7: Memory Interface → comms.Publish("memory.write") → Orchestrator → Memory Component
+    ├─► memory.Write(taggedResult)      ← M7: Memory Interface → comms.Publish("memory_write_request") → Orchestrator → Memory Component
     ├─► comms.Publish("task_result")    ← M1: back to Orchestrator
     ├─► lifecycle.Terminate(agentID)    ← M6: teardown microVM
     ├─► credentials.Revoke(agentID)     ← M5: invalidate scoped token
@@ -187,8 +182,8 @@ Agents do not receive their full capability set at spawn. The three-step drill-d
 
 ### Credential Delivery (Two-Phase)
 
-1. **Pre-authorize (spawn time)** — Credential Broker requests a scoped vault token from OpenBao covering the permission set derived from the task's required skill domains. The token is stored but not given to the agent.
-2. **Lazy delivery (runtime)** — When the agent invokes a skill that requires a credential, the Broker validates the request against the pre-approved permission set and returns the specific secret value. Nothing else is disclosed.
+1. **Pre-authorize (spawn time)** — Credential Broker sends a `credential_request` to the Orchestrator with the permission set scoped to the task's required skill domains. The Orchestrator proxies this to the Vault and returns a `credential_response`. The token is stored internally; the agent receives only a pointer.
+2. **Lazy delivery (runtime)** — When the agent invokes a skill that requires a credential, the Broker validates the request against the pre-approved permission set and sends another `credential_request` to the Orchestrator for the specific secret value. Nothing else is disclosed.
 
 ### Shutdown
 
@@ -232,12 +227,18 @@ aegis-agents/
 
 ## External Integrations
 
-This component has exactly two external integration points. It does not hold direct connections to the Memory Component, I/O Component, or any other Aegis peer — those are the Orchestrator's responsibility to route to.
+The Agents Component communicates with **exactly one external partner**: the Orchestrator, via the Communications Component (NATS JetStream). There are no direct connections to any other component.
 
-| Component | Protocol | Role |
-|-----------|----------|------|
-| Orchestrator | NATS JetStream (via Comms Interface) | **Sole external peer.** Receive `task_spec`; publish `task_result`, `status_update`, `capability_response`, `memory.write`, `memory.read` |
-| Credential Vault (OpenBao) | HTTP API (direct) | Pre-authorize permission scopes at spawn; validate and deliver credentials at runtime. Direct access is intentional — secrets must not transit the Orchestrator. |
+| Need | How It's Handled |
+|------|-----------------|
+| Task assignment | Orchestrator sends `task_spec` inbound |
+| Task results | Agents publishes `task_result` to Orchestrator |
+| Memory persistence | Agents sends `memory_write_request` to Orchestrator; Orchestrator fulfills it |
+| Memory retrieval | Agents sends `memory_read_request` to Orchestrator; Orchestrator returns `memory_response` |
+| Credential access | Agents sends `credential_request` to Orchestrator; Orchestrator proxies to Vault and returns `credential_response` |
+| Capability queries | Orchestrator sends `capability_query`; Agents responds with `capability_response` |
+
+> **Authorization Rule:** The Agents Component is not authorized to communicate with Memory, Credential Vault, User I/O, or any other Aegis OS component except through the Orchestrator. This is a security and architectural boundary — not a convention.
 
 ---
 
